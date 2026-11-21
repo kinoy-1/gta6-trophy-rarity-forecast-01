@@ -11,17 +11,39 @@ deterministic, no network):
     are often identical. The history is compressed to its distinct reads
     (one per refresh), each at its first appearance; a flat stretch is one
     observation, not many.
-  * The median is a saturating curve fitted to the distinct reads:
-    rate(t) = C * (1 - exp(-(t - d) / tau)), t in hours since the release
-    day began (2026-11-19T00:00:00Z). A trophy's earn rate is the share of
-    tracked players who have reached it so far: it rises as players play
-    and saturates at the share who will ever reach it, so a saturating
-    curve is the shape the data has to have. (tau, d) are found on a grid
-    and C by least squares in rate space -- fitting in logit space was
-    tried and is worse, because the page prints 2 decimals and the logit
-    of a 0.01% rate is mostly rounding noise. With fewer than 4 distinct
-    reads the curve is unidentified and the median falls back to a
-    logit-linear trend (shrunk toward persistence), or to persistence.
+  * The median is a saturating curve fitted to HOLDERS, not to rates:
+    a trophy's earn rate is holders / players-tracked, and the two move
+    against each other -- a flood of new players dilutes every rate even
+    as holders grow. So per trophy the curve rate(t) = C * (1 -
+    exp(-(t - d) / tau)) is fitted to H(t) = rate(t) * N(t), t in hours
+    since the release day began (2026-11-19T00:00:00Z), with C capped at
+    3x the holders seen (holders can grow past what was seen, but the cap
+    keeps the dilution prior the launch night showed: the first refresh
+    took tracked players 638 -> 3,868 while new players held far fewer
+    trophies each, so rates fell almost everywhere). N(t) is extrapolated
+    log-linearly in log(1 + t) (shrunk slope), and the median rate at the
+    target is H(target) / N(target). (tau, d) are found on a grid and C by
+    least squares -- fitting in logit space was tried and is worse,
+    because the page prints 2 decimals and the logit of a 0.01% rate is
+    mostly rounding noise. With fewer than 4 distinct reads the holder
+    curve is unidentified and the median falls back to the same curve
+    fitted to rates, then to a logit-linear trend (shrunk toward
+    persistence), then to persistence.
+  * The fitted move from the last rate is split into a common drift (the
+    mean move across trophies -- refreshes move every trophy together)
+    and an idiosyncratic drift per trophy; the idiosyncratic part is
+    shrunk to 25% (ALPHA = 0.25, the best of 0.10 / 0.25 / 0.50 / 1.00 on
+    longer backtests in saturating, dilution-dominated, volatile and
+    lognormal regimes) while the common drift is kept whole: extrapolating
+    one trophy's own early sprint 4.5 days out is what the backtests
+    punish most.
+  * When the history is flat (a single distinct read: no trend is
+    identified at all), the median is shifted down by the full dilution
+    of one refresh, ln(638 / 3868) = -1.80 in logit -- the launch night's
+    own refresh, which cut almost every rate roughly sixfold because the
+    new players held almost none of the trophies yet. A flat history
+    earns no trend, but the answer is read after the next refresh, so the
+    forecast expects it.
   * Spread (logit sd) combines a random-walk term growing with the
     horizon, the saturating fit's residual, the trend's slope uncertainty,
     and a refresh-jump term: the typical logit step between consecutive
@@ -64,6 +86,14 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 # Release day began 2026-11-19T00:00:00Z; time is hours since then.
 RELEASE = datetime(2026, 11, 19, tzinfo=timezone.utc)
 
+# Idiosyncratic drift kept (ALPHA); the common drift is kept whole.
+ALPHA_IDIO = 0.25
+# Holder-curve asymptote cap, in units of the most holders seen.
+HOLDER_CMAX = 3.0
+# Full one-refresh dilution shift (logit) when the history is flat:
+# ln(638 / 3868), the launch night's first refresh (players tracked
+# 638 -> 3,868; almost every rate fell roughly sixfold).
+DILUTION_SHIFT = -1.80
 # Spread: logit sd per square-root day of drift uncertainty.
 SIGMA_RW = 0.30
 # Prior for a refresh jump when the history shows none (flat launch night).
@@ -174,12 +204,14 @@ def distinct_reads(history):
     return kept
 
 
-def fit_saturating(ts, ys):
+def fit_saturating(ts, ys, cmax=1.0):
     """Fit rate = C * (1 - exp(-(t - d) / tau)) by grid over (tau, d).
 
     ts in hours since release, ys in fractions (0..1). C by least squares
-    in rate space, at least the largest rate seen, at most 1. Returns
-    (predict_fn, resid_sd_logit) or None when the fit is degenerate.
+    in rate space, at least the largest value seen, at most cmax (1.0 for
+    a rate, which cannot exceed 1; larger for holders, whose asymptote
+    can exceed the holders seen so far). Returns (predict_fn,
+    resid_sd_logit) or None when the fit is degenerate.
     """
     best = None
     for tau in TAUS:
@@ -189,7 +221,7 @@ def fit_saturating(ts, ys):
             if uu <= 1e-12:
                 continue
             c = sum(a * b for a, b in zip(u, ys)) / uu
-            c = max(max(ys), min(1.0, c))
+            c = max(max(ys), min(cmax, c))
             sse = sum((y - c * v) ** 2 for y, v in zip(ys, u))
             if best is None or sse < best[0]:
                 best = (sse, c, tau, d)
@@ -256,10 +288,20 @@ def forecast_case(case, name):
     n_refreshes = max(horizon_h / gap_h, 0.0)
     sigma_rw = SIGMA_RW * math.sqrt(horizon_d)
 
+    # Extrapolate the players tracked: log N ~ a + b*log(1 + t), slope
+    # shrunk; tracked players only grow, so never predict below the most
+    # seen. (The holder forecast divides by this at the target.)
+    n_obs = [max(1.0, float(r.get("players_tracked") or 1)) for r in reads]
+    a_n, b_n, _, _ = wls(xs, [math.log(v) for v in n_obs])
+    b_n = shrink_slope(b_n, len(xs))
+    n_target = max(max(n_obs), math.exp(a_n + b_n * x_target))
+
     # Per-trophy fits first (the refresh term needs the fitted curves).
     fits = []
     for i in range(len(trophies)):
-        pts = [(ts[j], reads[j]["rates"][i]) for j in range(n_reads)
+        pts = [(ts[j], reads[j]["rates"][i],
+                max(1.0, float(reads[j].get("players_tracked") or 1)))
+               for j in range(n_reads)
                if reads[j]["rates"][i] is not None]
         tt = [p[0] for p in pts]
         yy = [p[1] for p in pts]
@@ -272,9 +314,22 @@ def forecast_case(case, name):
         sat = None
         if len(tt) >= MIN_POINTS_SAT and max(yy) > 0:
             sat = fit_saturating(tt, [y / 100.0 for y in yy])
+        # Holder curve: H(t) = rate(t) * N(t), fitted on the same
+        # saturating shape scaled by the most holders seen, its asymptote
+        # allowed up to HOLDER_CMAX times that (holders grow past what
+        # was seen; the cap keeps the launch night's dilution prior).
+        sat_h = None
+        if len(tt) >= MIN_POINTS_SAT and max(yy) > 0:
+            hs = [p[1] / 100.0 * p[2] for p in pts]
+            max_h = max(hs)
+            if max_h > 0:
+                fitted_h = fit_saturating(
+                    tt, [h / max_h for h in hs], cmax=HOLDER_CMAX)
+                if fitted_h is not None:
+                    sat_h = (fitted_h, max_h)
         fits.append({"tt": tt, "yy": yy, "xx": xx, "ly": ly,
                      "med_lin": med_lin, "se_b": se_b, "x_bar": x_bar,
-                     "sat": sat})
+                     "sat": sat, "sat_h": sat_h})
 
     # Refresh-jump sd: pooled logit steps between consecutive distinct reads
     # after removing each trophy's fitted curve (saturating where fitted,
@@ -309,7 +364,13 @@ def forecast_case(case, name):
     sigma_refresh = min(SIGMA_REFRESH_MAX,
                         jump_sd * math.sqrt(n_refreshes))
 
-    rows = []
+    # Model median per trophy (holder curve first, then the rate curve,
+    # then the trend), and its drift from the last rate, in logit space.
+    # The drift splits into a common part (refreshes move every trophy
+    # together) and an idiosyncratic part, shrunk to ALPHA_IDIO.
+    model_logits = []
+    drifts = []
+    last_rates = []
     for i, trophy in enumerate(trophies):
         f = fits[i]
         last_rate = None
@@ -319,6 +380,29 @@ def forecast_case(case, name):
                 break
         if last_rate is None:
             last_rate = 0.0
+        last_rates.append(last_rate)
+        if not f["yy"] or max(f["yy"]) <= 0 or last_rate <= 0:
+            model_logits.append(None)
+            drifts.append(0.0)
+            continue
+        if f["sat_h"] is not None:
+            (pred_h, _), max_h = f["sat_h"]
+            h_target = pred_h(t_target) * max_h
+            med = max(0.01, min(99.99, h_target / n_target * 100.0))
+            model_logits.append(logit(med))
+        elif f["sat"] is not None:
+            pred, _ = f["sat"]
+            med = max(0.01, min(99.99, pred(t_target) * 100.0))
+            model_logits.append(logit(med))
+        else:
+            model_logits.append(logit(f["med_lin"]))
+        drifts.append(model_logits[-1] - logit(max(last_rate, 0.01)))
+    common_drift = (sum(drifts) / len(drifts)) if drifts else 0.0
+
+    rows = []
+    for i, trophy in enumerate(trophies):
+        f = fits[i]
+        last_rate = last_rates[i]
 
         if last_rate >= 99.995:
             # Everybody holds it, through a sixfold influx on launch night:
@@ -331,14 +415,17 @@ def forecast_case(case, name):
             med_logit = logit(ZERO_MEDIAN)
             sigma = ZERO_SIGMA
         else:
-            if f["sat"] is not None:
-                pred, resid_sat = f["sat"]
-                med = max(0.01, min(99.99, pred(t_target) * 100.0))
-                med_logit = logit(med)
-                resid = resid_sat
-            else:
-                med_logit = logit(f["med_lin"])
+            if n_reads <= 1:
+                # Flat history: no trend is identified, but the answer is
+                # read after the next refresh, so expect one full refresh
+                # of dilution -- the launch night's own, ln(638 / 3868).
+                med_logit = logit(max(last_rate, 0.01)) + DILUTION_SHIFT
                 resid = 0.0
+            else:
+                idio = drifts[i] - common_drift
+                med_logit = (logit(max(last_rate, 0.01))
+                             + ALPHA_IDIO * idio + common_drift)
+                resid = f["sat"][1] if f["sat"] is not None else 0.0
             sigma_slope = f["se_b"] * abs(x_target - f["x_bar"])
             sigma = math.sqrt(sigma_rw ** 2 + resid ** 2
                               + sigma_slope ** 2 + sigma_refresh ** 2)
